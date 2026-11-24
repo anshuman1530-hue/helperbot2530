@@ -1,2 +1,459 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+import difflib
+import math
+import os
+import random
+import re
+import uuid
+from collections import Counter
+from datetime import date, datetime, timedelta
+
+
+app = Flask(__name__)
+# Signs the cookie that identifies each visitor. When you host the app, set a
+# SECRET_KEY environment variable on the host to your own long random text.
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-before-hosting")
+app.permanent_session_lifetime = timedelta(days=365)  # names are remembered for a year
+
+JOKES = [
+    "Why do programmers prefer dark mode? Light attracts bugs!",
+    "Why was the computer cold? It left its Windows open.",
+    "There are 10 kinds of people: those who know binary and those who don't.",
+]
+
+# --- Optional AI through OpenRouter: used only for questions the bot's own brain ---
+# --- doesn't know. If no key is set, the bot simply says it doesn't know.        ---
+try:
+    import requests        # already installed on PythonAnywhere
+except ImportError:
+    requests = None
+
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")   # set it in the WSGI file, never here
+# Free models end in ":free". They change often, so these are tried in order
+# (OpenRouter allows up to 3). See openrouter.ai/models and filter by "free".
+AI_MODELS = [
+    "openai/gpt-oss-120b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+]
+SYSTEM_PROMPT = (
+    "You are HelperBot, a friendly chatbot on a student's school project website. "
+    "Reply in at most 3 short sentences of plain text with no markdown, "
+    "because replies may be read aloud."
+)
+PER_VISITOR_LIMIT = 10   # AI replies per visitor (until the server restarts)
+DAILY_LIMIT = 40         # free OpenRouter accounts allow 50 requests a day in total
+usage = {"day": None, "count": 0}
+FALLBACK = "I'm not sure about that yet. Type 'help' to see what I know!"
+
+visitors = {}  # visitor id -> {"chat": [(who, text), ...], "history": [msg, ...]}
+
+
+def get_visitor():
+    """Give each browser its own id (kept in a signed cookie) and its own chat."""
+    vid = session.get("id")
+    if vid is None:
+        vid = session["id"] = uuid.uuid4().hex
+        session.permanent = True
+    if vid not in visitors:
+        if len(visitors) > 500:                   # keep server memory small
+            visitors.pop(next(iter(visitors)))    # drop the oldest visitor
+        name = session.get("name")
+        if name:
+            greeting = f"Welcome back, {name}!"
+        else:
+            greeting = "Hi! Try 'tell me a joke' or 'flip a coin'."
+        visitors[vid] = {"chat": [("HelperBot", greeting)], "history": [], "ai_calls": 0}
+    return visitors[vid]
+
+
+# --- Things the bot can DO (an intent can run one of these) -----------------
+
+def get_time():
+    return "It's " + datetime.now().strftime("%I:%M %p") + "."
+
+
+def flip_coin():
+    return "It's " + random.choice(["heads", "tails"]) + "!"
+
+
+def tell_joke():
+    return random.choice(JOKES)
+
+
+# --- What the bot KNOWS ------------------------------------------------------
+# Each intent has example sentences (what people might say) and a reply
+# (a list of possible replies, or a function to run). To teach the bot
+# something new, add a new intent here. Nothing else needs to change.
+
+INTENTS = {
+    "greeting": {
+        "examples": ["hello", "hi", "hey", "hi there", "hey there", "good morning",
+                     "good afternoon", "good evening", "greetings"],
+        "reply": ["Hi there!", "Hello! How can I help?", "Hey! What's up?"],
+    },
+    "how_are_you": {
+        "examples": ["how are you", "how are you doing", "how is it going",
+                     "hows it going", "how do you feel", "are you ok", "how r u",
+                     "how r you", "how are u"],
+        "reply": ["Doing great, thanks for asking!", "I'm good! Ready to chat."],
+    },
+    "bot_name": {
+        "examples": ["what is your name", "whats your name", "who are you",
+                     "what should i call you", "tell me your name", "your name"],
+        "reply": ["I'm HelperBot, a chatbot built as a school project."],
+    },
+    "creator": {
+        "examples": ["who made you", "who created you", "who built you",
+                     "who is your creator", "who programmed you", "who is your developer"],
+        "reply": ["A student built me with Python and Flask for a school project!"],
+    },
+    "thanks": {
+        "examples": ["thanks", "thank you", "thanks a lot", "thank you so much",
+                     "thx", "much appreciated"],
+        "reply": ["You're welcome!", "Happy to help!"],
+    },
+    "help": {
+        "examples": ["help", "what can you do", "what do you know", "show me commands",
+                     "how can you help me", "what are your features"],
+        "reply": ["I can tell jokes, tell the time, flip a coin, remember your name "
+                  "(say 'my name is ...') and answer a few questions about Python, "
+                  "Flask and chatbots."],
+    },
+    "joke": {
+        "examples": ["tell me a joke", "joke", "make me laugh", "say something funny",
+                     "i want a joke", "do you know any jokes", "another joke"],
+        "reply": tell_joke,
+    },
+    "time": {
+        "examples": ["what time is it", "whats the time", "current time",
+                     "tell me the time", "time please", "what is the time now"],
+        "reply": get_time,
+    },
+    "coin": {
+        "examples": ["flip a coin", "toss a coin", "heads or tails", "coin flip",
+                     "flip coin"],
+        "reply": flip_coin,
+    },
+    "what_is_chatbot": {
+        "examples": ["what is a chatbot", "what are chatbots", "explain chatbots", "what is a bot",
+                     "how do chatbots work", "define chatbot"],
+        "reply": ["A chatbot is a program that talks with people in everyday language, "
+                  "by text or voice."],
+    },
+    "what_is_ai": {
+        "examples": ["what is ai", "what is artificial intelligence", "explain ai",
+                     "tell me about ai"],
+        "reply": ["AI means computer systems that do tasks that normally need human "
+                  "intelligence, like understanding language. I'm a much simpler "
+                  "program, but I use a similar idea: matching what you say to what I know."],
+    },
+    "what_is_python": {
+        "examples": ["what is python", "tell me about python", "explain python",
+                     "what is python used for"],
+        "reply": ["Python is a popular, beginner-friendly programming language. "
+                  "I'm written in it!"],
+    },
+    "what_is_flask": {
+        "examples": ["what is flask", "tell me about flask", "explain flask",
+                     "what is flask used for"],
+        "reply": ["Flask is a small Python framework for building websites. "
+                  "It's what puts me on the web."],
+    },
+    "how_it_works": {
+        "examples": ["how do you work", "how were you made", "how do you understand me",
+                     "how do you think", "explain how you work"],
+        "reply": ["I turn your message into word weights, compare it with the example "
+                  "sentences I know, and answer with the closest match. Rare words count "
+                  "more than common ones, and I can fix small typos."],
+    },
+}
+
+
+# --- The "brain": find the most similar example sentence --------------------
+#   words()      splits text into lowercase words
+#   fix_typos()  swaps a misspelled word for the closest word the bot knows
+#   weight()     rare words count more than common ones (the idea behind TF-IDF)
+#   cosine()     scores how similar two messages are, from 0 (nothing) to 1 (same)
+
+FILLER = {"please", "pls", "plz", "bro", "dude", "buddy", "mate", "just", "kindly", "today", "now"}
+
+
+def words(text):
+    found = re.findall(r"[a-z0-9]+", text.lower().replace("'", ""))
+    found = [w for w in found if w not in FILLER]
+    # strip a plural "s" so jokes = joke and thanks = thank
+    return [w[:-1] if len(w) > 3 and w.endswith("s") else w for w in found]
+
+
+EXAMPLES = [(name, words(ex)) for name, intent in INTENTS.items()
+            for ex in intent["examples"]]
+DOC_FREQ = Counter(w for _, ws in EXAMPLES for w in set(ws))  # in how many examples
+VOCAB = list(DOC_FREQ)
+
+
+def weight(word):
+    return math.log((len(EXAMPLES) + 1) / (DOC_FREQ.get(word, 0) + 1)) + 1
+
+
+def vector(ws):
+    # a word the bot has never seen counts extra, so a new topic is not matched by accident
+    return {w: count * weight(w) * (1 if w in DOC_FREQ else UNKNOWN_PENALTY)
+            for w, count in Counter(ws).items()}
+
+
+def cosine(a, b):
+    dot = sum(a[w] * b[w] for w in a if w in b)
+    size_a = math.sqrt(sum(x * x for x in a.values()))
+    size_b = math.sqrt(sum(x * x for x in b.values()))
+    return dot / (size_a * size_b) if size_a and size_b else 0.0
+
+
+def fix_typos(ws):
+    fixed = []
+    for w in ws:
+        if w in DOC_FREQ:
+            fixed.append(w)
+        else:
+            close = difflib.get_close_matches(w, VOCAB, n=1, cutoff=0.8)
+            fixed.append(close[0] if close else w)
+    return fixed
+
+
+UNKNOWN_PENALTY = 1.5
+EXAMPLE_VECTORS = [(name, vector(ws)) for name, ws in EXAMPLES]
+MIN_SCORE = 0.6   # below this similarity the bot admits it doesn't know
+
+
+def best_intent(text):
+    """Return (intent name, similarity score) for the closest known example."""
+    ws = fix_typos(words(text))
+    if not ws:
+        return None, 0.0
+    v = vector(ws)
+    best, score = None, 0.0
+    for name, example in EXAMPLE_VECTORS:
+        s = cosine(v, example)
+        if s > score:
+            best, score = name, s
+    return best, score
+
+
+def get_reply(msg, history):
+    # rules that need the visitor's own data come first
+    if msg.startswith("my name is "):
+        session["name"] = msg[11:].strip().title()[:30]
+        return f"Nice to meet you, {session['name']}!"
+    if "who am i" in msg or "my name" in msg:
+        name = session.get("name")
+        if name:
+            return f"You're {name}!"
+        return "I don't know yet. Say 'my name is ...'"
+    if msg in ("bye", "goodbye", "quit"):
+        return "Goodbye!"
+    if "last" in words(msg) and len(history) > 1:
+        return f'Earlier you said: "{history[-2]}"'
+
+    # everything else: find the closest known intent
+    name, score = best_intent(msg)
+    if name and score >= MIN_SCORE:
+        reply = INTENTS[name]["reply"]
+        return reply() if callable(reply) else random.choice(reply)
+
+    return None   # no intent matched; handle() decides what happens next
+
+
+def ask_ai(v, text):
+    """Ask an AI model through OpenRouter. Returns None when it isn't set up."""
+    if not OPENROUTER_KEY or requests is None:
+        return None
+
+    today = date.today()
+    if usage["day"] != today:
+        usage["day"], usage["count"] = today, 0
+    if usage["count"] >= DAILY_LIMIT or v["ai_calls"] >= PER_VISITOR_LIMIT:
+        return "I've used up my AI answers for now. Try again later!"
+    usage["count"] += 1      # failed tries count against OpenRouter's daily limit too
+    v["ai_calls"] += 1
+
+    # the last few chat turns give the AI some memory of the conversation
+    turns = []
+    for who, t in v["chat"][-10:]:
+        turns.append({"role": "user" if who == "You" else "assistant", "content": t})
+    while turns and turns[0]["role"] != "user":
+        turns.pop(0)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + turns
+    messages.append({"role": "user", "content": text})
+
+    try:
+        r = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": "Bearer " + OPENROUTER_KEY},
+            json={"models": AI_MODELS, "messages": messages, "max_tokens": 800},
+            timeout=40,
+        )
+        if r.status_code != 200:
+            app.logger.warning("OpenRouter error %s: %s", r.status_code, r.text[:300])
+            if r.status_code == 429:
+                return "My AI brain is busy right now. Try again in a minute!"
+            return "Sorry, my AI brain isn't reachable right now."
+        answer = (r.json()["choices"][0]["message"]["content"] or "").strip()
+        return answer or "Sorry, I couldn't think of an answer to that."
+    except Exception as e:
+        app.logger.warning("OpenRouter request failed: %s", e)
+        return "Sorry, my AI brain isn't reachable right now."
+
+
+def handle(text):
+    """Run one message through the bot and record both sides of this visitor's chat."""
+    v = get_visitor()
+    text = text[:500]
+    msg = text.lower()
+    v["history"].append(msg)
+    reply = get_reply(msg, v["history"])
+    if reply is None:
+        reply = ask_ai(v, text) or FALLBACK
+    v["chat"] += [("You", text), ("HelperBot", reply)]
+    del v["chat"][:-60]       # keep only the latest 60 messages
+    del v["history"][:-60]
+    return reply
+
+
+PAGE = """
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HelperBot</title>
+  <style>
+    :root {
+      --bg: #eef2f7; --card: #ffffff; --bot: #eef1f6; --bot-text: #1f2937;
+      --text: #1f2937; --line: #e5e7eb; --accent: linear-gradient(135deg, #6366f1, #8b5cf6);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0f172a; --card: #1e293b; --bot: #334155; --bot-text: #f1f5f9;
+              --text: #f1f5f9; --line: #334155; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; height: 100dvh; display: flex; justify-content: center; align-items: center;
+           background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; }
+    .app { width: 100%; height: 100%; max-width: 600px; display: flex; flex-direction: column;
+           background: var(--card); }
+    @media (min-width: 640px) {
+      .app { height: 90%; border-radius: 20px; overflow: hidden; box-shadow: 0 10px 40px rgba(0,0,0,.2); }
+    }
+    header { background: var(--accent); color: white; padding: 16px 20px; }
+    header h2 { margin: 0; font-size: 20px; }
+    header small { opacity: .85; }
+    .chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+    .msg { max-width: 80%; padding: 10px 14px; border-radius: 18px; line-height: 1.4;
+           animation: pop .2s ease-out; }
+    .You { align-self: flex-end; background: var(--accent); color: white; border-bottom-right-radius: 4px; }
+    .HelperBot { align-self: flex-start; background: var(--bot); color: var(--bot-text);
+                 border-bottom-left-radius: 4px; }
+    @keyframes pop { from { transform: scale(.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+    .chips { display: flex; gap: 8px; padding: 8px 16px 0; overflow-x: auto; }
+    .chips button { white-space: nowrap; border: 1px solid var(--line); background: var(--card);
+                    color: var(--text); padding: 6px 12px; border-radius: 999px; cursor: pointer; }
+    .chips button:hover { background: var(--bot); }
+    .bar { display: flex; gap: 8px; padding: 12px 16px; }
+    .bar input { flex: 1; padding: 12px 16px; font-size: 16px; border-radius: 999px;
+                 border: 1px solid var(--line); background: var(--bg); color: var(--text); outline: none; }
+    .bar input:focus { border-color: #6366f1; }
+    .bar button { border: 0; background: var(--accent); color: white; padding: 0 20px;
+                  border-radius: 999px; font-size: 16px; cursor: pointer; }
+    #mic { padding: 0 14px; }
+    #mic.listening { background: #ef4444; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h2>&#129302; HelperBot</h2>
+      <small>&#9679; Online</small>
+    </header>
+    <div class="chat">
+      {% for who, text in chat %}
+        <div class="msg {{ who }}">{{ text }}</div>
+      {% endfor %}
+      <div id="end"></div>
+    </div>
+    <form method="post" class="chips">
+      <button name="message" value="tell me a joke">&#128514; Joke</button>
+      <button name="message" value="what time is it">&#128339; Time</button>
+      <button name="message" value="flip a coin">&#129689; Flip a coin</button>
+      <button name="message" value="who am i">&#128100; Who am I?</button>
+    </form>
+    <form method="post" class="bar">
+      <input name="message" placeholder="Say something..." autofocus autocomplete="off">
+      <button type="button" id="mic" title="Speak">&#127908;</button>
+      <button>Send</button>
+    </form>
+  </div>
+  <script>
+    const mic = document.getElementById('mic');
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    function addBubble(text, who) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + who;
+      div.textContent = text;
+      document.getElementById('end').before(div);
+      div.scrollIntoView();
+    }
+
+    if (!SR) {
+      mic.style.display = 'none';   // this browser has no speech recognition
+    } else {
+      const rec = new SR();
+      rec.lang = 'en-US';
+
+      mic.onclick = () => {
+        if (mic.classList.contains('listening')) { rec.stop(); return; }
+        speechSynthesis.speak(new SpeechSynthesisUtterance(''));  // unlocks voice on iPhones
+        mic.classList.add('listening');
+        rec.start();
+      };
+      rec.onend = () => mic.classList.remove('listening');
+      rec.onerror = () => mic.classList.remove('listening');
+
+      rec.onresult = async (e) => {
+        const text = e.results[0][0].transcript;
+        addBubble(text, 'You');
+        const res = await fetch('/voice', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({message: text})
+        });
+        const data = await res.json();
+        addBubble(data.reply, 'HelperBot');
+        speechSynthesis.speak(new SpeechSynthesisUtterance(data.reply));
+      };
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET", "POST"])
+def home():
+    if request.method == "POST":
+        text = request.form["message"].strip()
+        if text:
+            handle(text)
+        return redirect("/#end")  # stops a refresh resending; #end scrolls to the newest message
+    return render_template_string(PAGE, chat=get_visitor()["chat"])
+
+
+@app.route("/voice", methods=["POST"])
+def voice():
+    text = (request.json or {}).get("message", "").strip()
+    if not text:
+        return jsonify({"reply": "I didn't catch that."})
+    return jsonify({"reply": handle(text)})
+
+
+if __name__ == "__main__":
+    app.run()
